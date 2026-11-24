@@ -1,0 +1,19 @@
+{
+  "id": "/",
+  "name": "Relay - conversations, in motion",
+  "short_name": "Relay",
+  "description": "Messages and calls with the people you keep close.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#171916",
+  "theme_color": "#171916",
+  "icons": [
+    {
+      "src": "/relay-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

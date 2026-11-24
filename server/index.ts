@@ -8,8 +8,9 @@ import { Server, Socket } from 'socket.io';
 import bcrypt from 'bcryptjs';
 
 type StoredUser = { id: string; name: string; email: string; passwordHash: string; createdAt: string };
-type ChatMessage = { id: string; senderId: string; recipientId: string; text: string; createdAt: string };
-type Database = { users: StoredUser[]; messages: ChatMessage[] };
+type GroupConversation = { id: string; name: string; memberIds: string[]; createdAt: string };
+type ChatMessage = { id: string; senderId: string; recipientId: string; groupId?: string; text: string; createdAt: string };
+type Database = { users: StoredUser[]; messages: ChatMessage[]; groups: GroupConversation[] };
 type AuthedSocket = Socket & { data: { userId?: string } };
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -24,8 +25,10 @@ if (isProduction && !process.env.RELAY_TOKEN_SECRET) {
 }
 
 function loadDatabase(): Database {
-  try { return JSON.parse(fs.readFileSync(dataFile, 'utf8')) as Database; }
-  catch { return { users: [], messages: [] }; }
+  try {
+    const stored = JSON.parse(fs.readFileSync(dataFile, 'utf8')) as Partial<Database>;
+    return { users: stored.users || [], messages: stored.messages || [], groups: stored.groups || [] };
+  } catch { return { users: [], messages: [], groups: [] }; }
 }
 const database = loadDatabase();
 function saveDatabase() {
@@ -92,12 +95,44 @@ app.get('/api/users', requireUser, (request, response) => {
   const user = response.locals.user as StoredUser;
   response.json({ users: database.users.filter((candidate) => candidate.id !== user.id).map((candidate) => ({ ...publicUser(candidate), online: activeSockets.has(candidate.id) })) });
 });
+app.get('/api/groups', requireUser, (request, response) => {
+  const user = response.locals.user as StoredUser;
+  response.json({ groups: database.groups.filter((group) => group.memberIds.includes(user.id)) });
+});
+app.post('/api/groups', requireUser, (request, response) => {
+  const user = response.locals.user as StoredUser;
+  const name = typeof request.body.name === 'string' ? request.body.name.trim().replace(/\s+/g, ' ') : '';
+  const requestedIds = Array.isArray(request.body.memberIds) ? request.body.memberIds.filter((id: unknown): id is string => typeof id === 'string') : [];
+  const memberIds = [...new Set([user.id, ...requestedIds])];
+  if (name.length < 2 || name.length > 60) { response.status(400).json({ error: 'Group name must be between 2 and 60 characters.' }); return; }
+  if (memberIds.length < 2 || memberIds.length > 20 || memberIds.some((id) => !database.users.some((candidate) => candidate.id === id))) {
+    response.status(400).json({ error: 'Choose between 1 and 19 other registered people.' }); return;
+  }
+  const group: GroupConversation = { id: crypto.randomUUID(), name, memberIds, createdAt: new Date().toISOString() };
+  database.groups.push(group); saveDatabase();
+  response.status(201).json({ group });
+});
 app.get('/api/messages/:peerId', requireUser, (request, response) => {
   const user = response.locals.user as StoredUser;
   const peerId = request.params.peerId;
-  if (!database.users.some((candidate) => candidate.id === peerId)) { response.status(404).json({ error: 'Person not found.' }); return; }
-  const messages = database.messages.filter((message) => (message.senderId === user.id && message.recipientId === peerId) || (message.senderId === peerId && message.recipientId === user.id));
-  response.json({ messages });
+  const group = database.groups.find((candidate) => candidate.id === peerId);
+  const peer = database.users.find((candidate) => candidate.id === peerId);
+  if (group ? !group.memberIds.includes(user.id) : !peer) { response.status(404).json({ error: 'Conversation not found.' }); return; }
+  const allMessages = database.messages.filter((message) => group
+    ? message.groupId === group.id
+    : !message.groupId && ((message.senderId === user.id && message.recipientId === peerId) || (message.senderId === peerId && message.recipientId === user.id)))
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+  const before = typeof request.query.before === 'string' ? Date.parse(request.query.before) : Number.NaN;
+  const beforeId = typeof request.query.beforeId === 'string' ? request.query.beforeId : '';
+  const eligible = Number.isFinite(before) ? allMessages.filter((message) => {
+    const time = Date.parse(message.createdAt);
+    return time < before || (time === before && beforeId && message.id.localeCompare(beforeId) < 0);
+  }) : allMessages;
+  const limitValue = Number(request.query.limit);
+  const limit = Number.isInteger(limitValue) ? Math.min(100, Math.max(1, limitValue)) : 50;
+  const hasMore = eligible.length > limit;
+  const messages = eligible.slice(-limit);
+  response.json({ messages, hasMore });
 });
 
 if (isProduction) {
@@ -133,15 +168,19 @@ io.on('connection', (rawSocket) => {
 
   socket.on('message:send', (payload: { recipientId?: unknown; text?: unknown }, acknowledge?: (result: { error?: string; message?: ChatMessage }) => void) => {
     const recipientId = payload?.recipientId;
+    const groupId = typeof (payload as { groupId?: unknown })?.groupId === 'string' ? (payload as { groupId: string }).groupId : undefined;
     const text = typeof payload?.text === 'string' ? payload.text.trim() : '';
-    if (typeof recipientId !== 'string' || recipientId === userId || !database.users.some((user) => user.id === recipientId)) { acknowledge?.({ error: 'Choose a valid person to message.' }); return; }
+    const group = groupId ? database.groups.find((candidate) => candidate.id === groupId) : undefined;
+    const directRecipient = typeof recipientId === 'string' && database.users.some((candidate) => candidate.id === recipientId && candidate.id !== userId);
+    if (groupId ? !group?.memberIds.includes(userId) : !directRecipient) { acknowledge?.({ error: 'Choose a valid conversation to message.' }); return; }
     if (!text || text.length > 5000) { acknowledge?.({ error: 'Messages must be between 1 and 5000 characters.' }); return; }
-    const message: ChatMessage = { id: crypto.randomUUID(), senderId: userId, recipientId, text, createdAt: new Date().toISOString() };
+    const message: ChatMessage = { id: crypto.randomUUID(), senderId: userId, recipientId: groupId || recipientId as string, ...(groupId ? { groupId } : {}), text, createdAt: new Date().toISOString() };
     database.messages.push(message); saveDatabase();
-    io.to(`user:${userId}`).to(`user:${recipientId}`).emit('message:new', message);
+    const recipients = group ? group.memberIds : [userId, recipientId as string];
+    for (const recipient of recipients) io.to(`user:${recipient}`).emit('message:new', message);
     acknowledge?.({ message });
   });
-  socket.on('call:offer', (payload: { to?: unknown; offer?: unknown }) => relayToPeer(socket, 'call:offer', payload?.to, { offer: payload?.offer }));
+  socket.on('call:offer', (payload: { to?: unknown; offer?: unknown; mode?: unknown }) => relayToPeer(socket, 'call:offer', payload?.to, { offer: payload?.offer, mode: payload?.mode === 'video' ? 'video' : 'audio' }));
   socket.on('call:answer', (payload: { to?: unknown; answer?: unknown }) => relayToPeer(socket, 'call:answer', payload?.to, { answer: payload?.answer }));
   socket.on('call:ice', (payload: { to?: unknown; candidate?: unknown }) => relayToPeer(socket, 'call:ice', payload?.to, { candidate: payload?.candidate }));
   socket.on('call:end', (payload: { to?: unknown }) => relayToPeer(socket, 'call:end', payload?.to));

@@ -1,15 +1,17 @@
-import { FormEvent, useEffect, useRef, useState } from 'react';
+import { FormEvent, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
 import {
   ArrowLeft, ArrowUpRight, AudioLines, CheckCheck,
-  ChevronDown, Headphones, LogOut, Mic, MicOff, MoreHorizontal, Phone,
-  PhoneCall, Plus, Search, Send, ShieldCheck, Smile, UserPlus,
+  ChevronDown, Download, Headphones, LogOut, Mic, MicOff, MoreHorizontal, Phone,
+  Plus, Search, Send, ShieldCheck, Smile, UserPlus, Video, VideoOff,
   X,
 } from 'lucide-react';
 
 type User = { id: string; name: string; email: string; online?: boolean; lastSeen?: string };
-type Message = { id: string; senderId: string; recipientId: string; text: string; createdAt: string };
-type CallState = { peer: User; phase: 'incoming' | 'outgoing' | 'active'; offer?: RTCSessionDescriptionInit };
+type Group = { id: string; name: string; memberIds: string[]; createdAt: string };
+type ChatTarget = { id: string; name: string; email?: string; online?: boolean; group?: boolean; memberIds?: string[] };
+type Message = { id: string; senderId: string; recipientId: string; groupId?: string; text: string; createdAt: string };
+type CallState = { peer: User; phase: 'incoming' | 'outgoing' | 'active'; mode: 'audio' | 'video'; offer?: RTCSessionDescriptionInit };
 
 const tokenKey = 'relay-token';
 const initials = (name: string) => name.split(/\s+/).slice(0, 2).map((part) => part[0]).join('').toUpperCase();
@@ -30,11 +32,15 @@ export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem(tokenKey) || '');
   const [me, setMe] = useState<User | null>(null);
   const [people, setPeople] = useState<User[]>([]);
-  const [selected, setSelected] = useState<User | null>(null);
+  const [groups, setGroups] = useState<Group[]>([]);
+  const [selected, setSelected] = useState<ChatTarget | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [text, setText] = useState('');
   const [query, setQuery] = useState('');
   const [peopleFilter, setPeopleFilter] = useState<'all' | 'online'>('all');
+  const [groupModal, setGroupModal] = useState(false);
+  const [groupName, setGroupName] = useState('');
+  const [groupMembers, setGroupMembers] = useState<string[]>([]);
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
   const [authName, setAuthName] = useState('');
   const [email, setEmail] = useState('');
@@ -44,17 +50,51 @@ export default function App() {
   const [socket, setSocket] = useState<Socket | null>(null);
   const [call, setCall] = useState<CallState | null>(null);
   const [muted, setMuted] = useState(false);
+  const [cameraOff, setCameraOff] = useState(false);
+  const [canInstall, setCanInstall] = useState(false);
   const [mobileChat, setMobileChat] = useState(false);
+  const [hasMoreMessages, setHasMoreMessages] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [olderError, setOlderError] = useState('');
+  const [installPrompt, setInstallPrompt] = useState<Event | null>(null);
+  const messagesArea = useRef<HTMLDivElement>(null);
   const messagesEnd = useRef<HTMLDivElement>(null);
+  const hasMoreRef = useRef(false);
+  const loadingOlderRef = useRef(false);
+  const pendingScrollAdjustment = useRef<{ height: number; top: number } | null>(null);
+  const wasAtBottom = useRef(true);
+  const initialHistoryLoad = useRef(false);
   const peerConnection = useRef<RTCPeerConnection | null>(null);
   const localStream = useRef<MediaStream | null>(null);
+  const localVideo = useRef<HTMLVideoElement>(null);
+  const remoteVideo = useRef<HTMLVideoElement>(null);
   const remoteAudio = useRef<HTMLAudioElement>(null);
   const callRef = useRef<CallState | null>(null);
-  const selectedRef = useRef<User | null>(null);
+  const selectedRef = useRef<ChatTarget | null>(null);
   const queuedIce = useRef<RTCIceCandidateInit[]>([]);
 
   useEffect(() => { callRef.current = call; }, [call]);
   useEffect(() => { selectedRef.current = selected; }, [selected]);
+  useEffect(() => { hasMoreRef.current = hasMoreMessages; }, [hasMoreMessages]);
+  useEffect(() => { loadingOlderRef.current = loadingOlder; }, [loadingOlder]);
+  useEffect(() => {
+    if (call?.mode === 'video' && localVideo.current && localStream.current) localVideo.current.srcObject = localStream.current;
+  }, [call]);
+
+  useEffect(() => {
+    const handleInstallPrompt = (event: Event) => {
+      event.preventDefault();
+      setInstallPrompt(event);
+      setCanInstall(true);
+    };
+    const handleInstalled = () => { setCanInstall(false); setInstallPrompt(null); };
+    window.addEventListener('beforeinstallprompt', handleInstallPrompt);
+    window.addEventListener('appinstalled', handleInstalled);
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleInstallPrompt);
+      window.removeEventListener('appinstalled', handleInstalled);
+    };
+  }, []);
 
   useEffect(() => {
     if (!token) { setMe(null); return; }
@@ -68,17 +108,19 @@ export default function App() {
     const client = io({ auth: { token } });
     setSocket(client);
     const refreshPeople = () => request<{ users: User[] }>('/api/users', token).then(({ users }) => setPeople(users));
+    const refreshGroups = () => request<{ groups: Group[] }>('/api/groups', token).then(({ groups }) => setGroups(groups));
     refreshPeople();
+    refreshGroups();
     client.on('presence:update', refreshPeople);
     client.on('message:new', (message: Message) => {
       setMessages((current) => {
         const active = selectedRef.current;
-        const relevant = active && [message.senderId, message.recipientId].includes(active.id);
+        const relevant = active && (active.group ? message.groupId === active.id : !message.groupId && [message.senderId, message.recipientId].includes(active.id));
         return relevant && !current.some((item) => item.id === message.id) ? [...current, message] : current;
       });
       refreshPeople();
     });
-    client.on('call:offer', ({ from, offer }: { from: User; offer: RTCSessionDescriptionInit }) => setCall({ peer: from, phase: 'incoming', offer }));
+    client.on('call:offer', ({ from, offer, mode }: { from: User; offer: RTCSessionDescriptionInit; mode?: 'audio' | 'video' }) => setCall({ peer: from, phase: 'incoming', mode: mode || 'audio', offer }));
     client.on('call:answer', async ({ answer }: { answer: RTCSessionDescriptionInit }) => {
       const connection = peerConnection.current;
       if (!connection) return;
@@ -95,13 +137,34 @@ export default function App() {
     return () => { client.disconnect(); setSocket(null); };
   }, [me, token]);
 
-  useEffect(() => { messagesEnd.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+  useLayoutEffect(() => {
+    const area = messagesArea.current;
+    if (!area || !messages.length) return;
+    const adjustment = pendingScrollAdjustment.current;
+    if (adjustment) {
+      area.scrollTop = adjustment.top + area.scrollHeight - adjustment.height;
+      pendingScrollAdjustment.current = null;
+    } else if (initialHistoryLoad.current || wasAtBottom.current) {
+      area.scrollTop = area.scrollHeight;
+      initialHistoryLoad.current = false;
+    }
+  }, [messages]);
 
   useEffect(() => {
     if (!selected || !token) { setMessages([]); return; }
-    request<{ messages: Message[] }>(`/api/messages/${selected.id}`, token)
-      .then(({ messages: history }) => setMessages(history))
-      .catch(() => setMessages([]));
+    let active = true;
+    initialHistoryLoad.current = true;
+    setMessages([]);
+    setOlderError('');
+    setHasMoreMessages(false);
+    request<{ messages: Message[]; hasMore: boolean }>(`/api/messages/${selected.id}?limit=50`, token)
+      .then(({ messages: history, hasMore }) => {
+        if (!active) return;
+        setMessages(history);
+        setHasMoreMessages(hasMore);
+      })
+      .catch(() => { if (active) setMessages([]); });
+    return () => { active = false; };
   }, [selected, token]);
 
   async function submitAuth(event: FormEvent) {
@@ -116,26 +179,75 @@ export default function App() {
   }
 
   function signOut() {
-    finishCall(true); localStorage.removeItem(tokenKey); setToken(''); setMe(null); setPeople([]); setSelected(null); setMessages([]);
+    finishCall(true); localStorage.removeItem(tokenKey); setToken(''); setMe(null); setPeople([]); setGroups([]); setSelected(null); setMessages([]);
+  }
+
+  async function loadOlderMessages() {
+    if (!selected || !token || !hasMoreRef.current || loadingOlderRef.current || !messages.length) return;
+    const area = messagesArea.current;
+    if (!area) return;
+    setLoadingOlder(true); setOlderError('');
+    const firstMessage = messages[0];
+    pendingScrollAdjustment.current = { height: area.scrollHeight, top: area.scrollTop };
+    try {
+      const { messages: older, hasMore } = await request<{ messages: Message[]; hasMore: boolean }>(
+        `/api/messages/${selected.id}?limit=50&before=${encodeURIComponent(firstMessage.createdAt)}&beforeId=${encodeURIComponent(firstMessage.id)}`, token,
+      );
+      if (selectedRef.current?.id !== selected.id) { pendingScrollAdjustment.current = null; return; }
+      setMessages((current) => [...older, ...current.filter((message) => !older.some((item) => item.id === message.id))]);
+      setHasMoreMessages(hasMore);
+    } catch (error) {
+      pendingScrollAdjustment.current = null;
+      setOlderError(error instanceof Error ? error.message : 'Could not load earlier messages');
+    } finally { setLoadingOlder(false); }
+  }
+
+  function handleMessageScroll() {
+    const area = messagesArea.current;
+    if (!area) return;
+    wasAtBottom.current = area.scrollHeight - area.scrollTop - area.clientHeight < 90;
+    if (area.scrollTop < 70) void loadOlderMessages();
+  }
+
+  async function installApp() {
+    if (!installPrompt) {
+      setAuthError('To install Relay, open your browser menu and choose Install app or Add to Home Screen.');
+      return;
+    }
+    const prompt = installPrompt as Event & { prompt: () => Promise<void>; userChoice: Promise<{ outcome: string }> };
+    await prompt.prompt();
+    const choice = await prompt.userChoice;
+    if (choice.outcome === 'accepted') { setCanInstall(false); setInstallPrompt(null); }
+  }
+
+  async function createGroup(event: FormEvent) {
+    event.preventDefault();
+    try {
+      const { group } = await request<{ group: Group }>('/api/groups', token, { name: groupName, memberIds: groupMembers });
+      setGroups((current) => [group, ...current]);
+      setSelected({ id: group.id, name: group.name, group: true, memberIds: group.memberIds });
+      setGroupModal(false); setGroupName(''); setGroupMembers([]); setMobileChat(true);
+    } catch (error) { setAuthError(error instanceof Error ? error.message : 'Could not create group'); }
   }
 
   function sendMessage(event: FormEvent) {
     event.preventDefault();
     if (!selected || !text.trim() || !socket) return;
-    socket.emit('message:send', { recipientId: selected.id, text: text.trim() }, (result: { error?: string }) => {
+    socket.emit('message:send', { ...(selected.group ? { groupId: selected.id } : { recipientId: selected.id }), text: text.trim() }, (result: { error?: string }) => {
       if (result?.error) return;
       setText('');
     });
   }
 
-  function createPeer(peer: User) {
+  function createPeer(peer: User, mode: 'audio' | 'video') {
     const connection = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
     peerConnection.current = connection;
     connection.onicecandidate = (event) => {
       if (event.candidate) socket?.emit('call:ice', { to: peer.id, candidate: event.candidate });
     };
     connection.ontrack = (event) => {
-      if (remoteAudio.current) remoteAudio.current.srcObject = event.streams[0];
+      if (remoteAudio.current && mode === 'audio') remoteAudio.current.srcObject = event.streams[0];
+      if (remoteVideo.current && mode === 'video') remoteVideo.current.srcObject = event.streams[0];
     };
     connection.onconnectionstatechange = () => {
       if (connection.connectionState === 'connected') setCall((current) => current ? { ...current, phase: 'active' } : current);
@@ -145,15 +257,16 @@ export default function App() {
     return connection;
   }
 
-  async function startCall(peer: User) {
+  async function startCall(peer: User, mode: 'audio' | 'video' = 'audio') {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: mode === 'video' });
       localStream.current = stream;
-      const connection = createPeer(peer);
+      if (localVideo.current && mode === 'video') localVideo.current.srcObject = stream;
+      const connection = createPeer(peer, mode);
       const offer = await connection.createOffer();
       await connection.setLocalDescription(offer);
-      setCall({ peer, phase: 'outgoing' });
-      socket?.emit('call:offer', { to: peer.id, offer });
+      setCall({ peer, phase: 'outgoing', mode });
+      socket?.emit('call:offer', { to: peer.id, offer, mode });
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : 'Microphone access is required to call');
     }
@@ -163,9 +276,10 @@ export default function App() {
     const pending = callRef.current;
     if (!pending?.offer) return;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: pending.mode === 'video' });
       localStream.current = stream;
-      const connection = createPeer(pending.peer);
+      if (localVideo.current && pending.mode === 'video') localVideo.current.srcObject = stream;
+      const connection = createPeer(pending.peer, pending.mode);
       await connection.setRemoteDescription(pending.offer);
       for (const candidate of queuedIce.current.splice(0)) await connection.addIceCandidate(candidate);
       const answer = await connection.createAnswer();
@@ -184,12 +298,19 @@ export default function App() {
     localStream.current?.getTracks().forEach((track) => track.stop()); localStream.current = null;
     queuedIce.current = [];
     if (remoteAudio.current) remoteAudio.current.srcObject = null;
-    setCall(null); setMuted(false);
+    if (localVideo.current) localVideo.current.srcObject = null;
+    if (remoteVideo.current) remoteVideo.current.srcObject = null;
+    setCall(null); setMuted(false); setCameraOff(false);
   }
 
   function toggleMute() {
     const next = !muted; setMuted(next);
     localStream.current?.getAudioTracks().forEach((track) => { track.enabled = !next; });
+  }
+
+  function toggleCamera() {
+    const next = !cameraOff; setCameraOff(next);
+    localStream.current?.getVideoTracks().forEach((track) => { track.enabled = !next; });
   }
 
   if (!me) return (
@@ -219,8 +340,13 @@ export default function App() {
     const matchesQuery = person.name.toLowerCase().includes(query.toLowerCase()) || person.email.toLowerCase().includes(query.toLowerCase());
     return matchesQuery && (peopleFilter === 'all' || person.online);
   });
+  const filteredGroups = groups.filter((group) => group.name.toLowerCase().includes(query.toLowerCase()));
+  const conversationTargets: ChatTarget[] = [
+    ...filteredGroups.map((group) => ({ id: group.id, name: group.name, group: true, memberIds: group.memberIds })),
+    ...filteredPeople,
+  ];
   const lastMessages = new Map<string, Message>();
-  for (const message of messages) lastMessages.set(message.senderId === me.id ? message.recipientId : message.senderId, message);
+  for (const message of messages) lastMessages.set(message.groupId || (message.senderId === me.id ? message.recipientId : message.senderId), message);
 
   return (
     <main className={`app-shell ${mobileChat ? 'show-chat' : ''}`}>
@@ -230,15 +356,16 @@ export default function App() {
         <div className="rail-bottom"><button className="avatar rail-avatar" title={me.name}>{initials(me.name)}</button></div>
       </aside>
       <aside className="inbox">
-        <header className="inbox-header"><div><div className="section-label">YOUR SPACE</div><h2>Messages <span>{people.length}</span></h2></div><button className="icon-button compose-button" title="New conversation" onClick={() => document.querySelector<HTMLInputElement>('.search-box input')?.focus()}><Plus size={18}/></button></header>
+        <header className="inbox-header"><div><div className="section-label">YOUR SPACE</div><h2>Messages <span>{conversationTargets.length}</span></h2></div><div className="inbox-header-actions"><button className={`icon-button ${canInstall ? 'install-ready' : ''}`} title="Install Relay" onClick={installApp}><Download size={17}/></button><button className="icon-button compose-button" title="Create group chat" onClick={() => setGroupModal(true)}><Plus size={18}/></button></div></header>
         <label className="search-box"><Search size={16}/><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Find someone"/><span className="search-shortcut">/</span></label>
-        <div className="inbox-tabs"><button className={peopleFilter === 'all' ? 'tab-selected' : ''} onClick={() => setPeopleFilter('all')}>All <span>{people.length}</span></button><button className={peopleFilter === 'online' ? 'tab-selected' : ''} onClick={() => setPeopleFilter('online')}>Online <i className="tab-dot"/></button></div>
+        <div className="inbox-tabs"><button className={peopleFilter === 'all' ? 'tab-selected' : ''} onClick={() => setPeopleFilter('all')}>All <span>{conversationTargets.length}</span></button><button className={peopleFilter === 'online' ? 'tab-selected' : ''} onClick={() => setPeopleFilter('online')}>Online <i className="tab-dot"/></button></div>
         <div className="contact-list">
-          {filteredPeople.length ? filteredPeople.map((person, index) => {
-            const recent = lastMessages.get(person.id);
-            return <button key={person.id} className={`contact ${selected?.id === person.id ? 'contact-selected' : ''}`} onClick={() => { setSelected(person); setMobileChat(true); }}>
-              <div className={`avatar avatar-${index % 5}`}>{initials(person.name)}<i className={person.online ? 'online-dot' : 'offline-dot'}/></div>
-              <div className="contact-copy"><div className="contact-top"><strong>{person.name}</strong><time>{recent ? clock(recent.createdAt) : ''}</time></div><p>{recent ? recent.text : person.online ? 'Around now' : 'Say hello'}</p></div>
+          {conversationTargets.length ? conversationTargets.map((target, index) => {
+            const recent = lastMessages.get(target.id);
+            const memberCount = target.memberIds?.length || 0;
+            return <button key={target.id} className={`contact ${selected?.id === target.id ? 'contact-selected' : ''}`} onClick={() => { setSelected(target); setMobileChat(true); }}>
+              <div className={`avatar avatar-${index % 5} ${target.group ? 'group-avatar' : ''}`}>{initials(target.name)}{!target.group && <i className={target.online ? 'online-dot' : 'offline-dot'}/>}</div>
+              <div className="contact-copy"><div className="contact-top"><strong>{target.name}</strong><time>{recent ? clock(recent.createdAt) : ''}</time></div><p>{recent ? recent.text : target.group ? `${memberCount} people` : target.online ? 'Around now' : 'Say hello'}</p></div>
             </button>;
           }) : <div className="empty-people"><div className="empty-icon"><UserPlus size={19}/></div><strong>No conversations yet</strong><p>Share Relay with someone and their account will appear here.</p></div>}
         </div>
@@ -248,36 +375,40 @@ export default function App() {
         {selected ? <>
           <header className="conversation-header">
             <button className="icon-button back-button" onClick={() => setMobileChat(false)} title="Back to messages"><ArrowLeft size={18}/></button>
-            <div className="avatar conversation-avatar">{initials(selected.name)}<i className={selected.online ? 'online-dot' : 'offline-dot'}/></div>
-            <div className="conversation-person"><h2>{selected.name}</h2><span><i className={selected.online ? 'status-dot' : 'status-dot away'}/>{selected.online ? 'Online now' : 'Away'}</span></div>
-            <div className="conversation-actions"><button className="icon-button call-action" title="Start voice call" onClick={() => startCall(selected)} disabled={!!call}><Phone size={18}/></button><button className="icon-button" title="More options"><MoreHorizontal size={19}/></button></div>
+            <div className={`avatar conversation-avatar ${selected.group ? 'group-avatar' : ''}`}>{initials(selected.name)}{!selected.group && <i className={selected.online ? 'online-dot' : 'offline-dot'}/>}</div>
+            <div className="conversation-person"><h2>{selected.name}</h2><span>{selected.group ? `${selected.memberIds?.length || 0} members` : <><i className={selected.online ? 'status-dot' : 'status-dot away'}/>{selected.online ? 'Online now' : 'Away'}</>}</span></div>
+            <div className="conversation-actions">{!selected.group && <><button className="icon-button call-action" title="Start voice call" onClick={() => { const peer = people.find((person) => person.id === selected.id); if (peer) void startCall(peer, 'audio'); }} disabled={!!call}><Phone size={18}/></button><button className="icon-button call-action" title="Start video call" onClick={() => { const peer = people.find((person) => person.id === selected.id); if (peer) void startCall(peer, 'video'); }} disabled={!!call}><Video size={18}/></button></>}<button className="icon-button" title="More options"><MoreHorizontal size={19}/></button></div>
           </header>
-          <div className="message-area">
-            <div className="thread-intro"><div className="avatar intro-avatar">{initials(selected.name)}</div><h3>You and {selected.name.split(' ')[0]}</h3><p>This is the beginning of something good.</p><span>DIRECT CONVERSATION</span></div>
+          <div className="message-area" ref={messagesArea} onScroll={handleMessageScroll}>
+            <div className="thread-intro"><div className={`avatar intro-avatar ${selected.group ? 'group-avatar' : ''}`}>{initials(selected.name)}</div><h3>{selected.group ? selected.name : `You and ${selected.name.split(' ')[0]}`}</h3><p>{selected.group ? `${selected.memberIds?.length || 0} people in this conversation.` : 'This is the beginning of something good.'}</p><span>{selected.group ? 'GROUP CONVERSATION' : 'DIRECT CONVERSATION'}</span></div>
+            {(loadingOlder || hasMoreMessages) && <div className="history-status">{loadingOlder ? 'Loading earlier messages…' : 'Scroll up for earlier messages'}</div>}
+            {olderError && <button className="history-error" onClick={() => void loadOlderMessages()}>{olderError} · Tap to retry</button>}
             <div className="message-list">
               {messages.map((message, index) => {
                 const own = message.senderId === me.id;
                 const prior = messages[index - 1];
                 const grouped = prior?.senderId === message.senderId && new Date(message.createdAt).getTime() - new Date(prior.createdAt).getTime() < 300000;
+                const senderName = own ? 'You' : selected.group ? people.find((person) => person.id === message.senderId)?.name || 'A member' : selected.name.split(' ')[0];
                 return <div key={message.id} className={`message-row ${own ? 'message-own' : ''} ${grouped ? 'message-grouped' : ''}`}>
-                  {!own && !grouped && <div className="avatar message-avatar">{initials(selected.name)}</div>}
+                  {!own && !grouped && <div className="avatar message-avatar">{initials(senderName)}</div>}
                   {!own && grouped && <div className="avatar-spacer"/>}
-                  <div className="message-content"><div className="message-bubble">{message.text}</div><div className="message-meta">{!grouped && <span>{own ? 'You' : selected.name.split(' ')[0]} · </span>}{clock(message.createdAt)} {own && <CheckCheck size={13} className="read-check"/>}</div></div>
+                  <div className="message-content"><div className="message-bubble">{message.text}</div><div className="message-meta">{!grouped && <span>{senderName} · </span>}{clock(message.createdAt)} {own && <CheckCheck size={13} className="read-check"/>}</div></div>
                 </div>;
               })}
               <div ref={messagesEnd}/>
             </div>
           </div>
-          <form className="composer" onSubmit={sendMessage}><div className="composer-tools"><button type="button" className="icon-button" title="Attach a file"><Plus size={18}/></button></div><input value={text} onChange={(event) => setText(event.target.value)} placeholder={`Message ${selected.name.split(' ')[0]}…`} aria-label="Message"/><button type="button" className="icon-button emoji-button" title="Emoji"><Smile size={18}/></button><button className="send-button" title="Send message" disabled={!text.trim()}><Send size={17}/></button></form>
-          <div className="conversation-footnote"><span>MESSAGES ARE JUST BETWEEN YOU TWO</span><span><ChevronDown size={12}/> ENTER TO SEND</span></div>
+          <form className="composer" onSubmit={sendMessage}><div className="composer-tools"><button type="button" className="icon-button" title="Attach a file"><Plus size={18}/></button></div><input value={text} onChange={(event) => setText(event.target.value)} placeholder={`Message ${selected.group ? selected.name : selected.name.split(' ')[0]}…`} aria-label="Message"/><button type="button" className="icon-button emoji-button" title="Emoji"><Smile size={18}/></button><button className="send-button" title="Send message" disabled={!text.trim()}><Send size={17}/></button></form>
+          <div className="conversation-footnote"><span>{selected.group ? 'A SHARED GROUP CONVERSATION' : 'MESSAGES ARE JUST BETWEEN YOU TWO'}</span><span><ChevronDown size={12}/> ENTER TO SEND</span></div>
         </> : <div className="welcome-state"><div className="welcome-symbol"><AudioLines size={26}/></div><span className="eyebrow">YOUR PEOPLE, RIGHT HERE</span><h2>A good conversation<br/><em>starts somewhere.</em></h2><p>Choose someone from your messages to pick up where you left off.</p><div className="welcome-line"><span/><span className="welcome-dot"/><span/></div></div>}
       </section>
       <aside className="details-pane">
         <div className="details-top"><span className="section-label">YOUR PEOPLE</span><button className="icon-button" title="More"><MoreHorizontal size={18}/></button></div>
-        {selected ? <><div className="person-card"><div className="avatar person-avatar">{initials(selected.name)}<i className={selected.online ? 'online-dot' : 'offline-dot'}/></div><h2>{selected.name}</h2><span>{selected.email}</span><div className="person-presence"><i className={selected.online ? 'status-dot' : 'status-dot away'}/>{selected.online ? 'Available to chat' : 'Not online right now'}</div><div className="person-shortcuts"><button onClick={() => startCall(selected)} disabled={!!call}><PhoneCall size={17}/><span>Call</span></button><button onClick={() => document.querySelector<HTMLInputElement>('.composer input')?.focus()}><Send size={16}/><span>Message</span></button></div></div><div className="details-divider"/><div className="details-section"><div className="details-heading">Shared space <button className="icon-button" title="Add"><Plus size={16}/></button></div><div className="shared-empty"><div className="shared-icon"><Headphones size={17}/></div><p>Your calls together<br/>will show up here.</p></div></div><div className="details-bottom"><span><ShieldCheck size={14}/> PRIVATE CONVERSATION</span></div></> : <div className="details-quiet"><div className="quiet-line"/><p>Your closest circles,<br/>without the noise.</p><span>MESSAGES / CALLS / PEOPLE</span></div>}
+        {selected ? <><div className="person-card"><div className={`avatar person-avatar ${selected.group ? 'group-avatar' : ''}`}>{initials(selected.name)}{!selected.group && <i className={selected.online ? 'online-dot' : 'offline-dot'}/>}</div><h2>{selected.name}</h2><span>{selected.group ? `${selected.memberIds?.length || 0} members` : selected.email}</span>{!selected.group && <div className="person-presence"><i className={selected.online ? 'status-dot' : 'status-dot away'}/>{selected.online ? 'Available to chat' : 'Not online right now'}</div>}<div className="person-shortcuts">{!selected.group && <button onClick={() => { const peer = people.find((person) => person.id === selected.id); if (peer) void startCall(peer, 'video'); }} disabled={!!call}><Video size={17}/><span>Video</span></button>}<button onClick={() => document.querySelector<HTMLInputElement>('.composer input')?.focus()}><Send size={16}/><span>Message</span></button></div></div><div className="details-divider"/><div className="details-section"><div className="details-heading">{selected.group ? 'People' : 'Shared space'}</div>{selected.group ? <div className="group-member-list">{selected.memberIds?.map((memberId) => { const member = memberId === me.id ? me : people.find((person) => person.id === memberId); return member ? <div className="group-member" key={memberId}><div className="avatar">{initials(member.name)}</div><span>{member.name}{memberId === me.id ? ' (you)' : ''}</span></div> : null; })}</div> : <div className="shared-empty"><div className="shared-icon"><Headphones size={17}/></div><p>Your calls together<br/>will show up here.</p></div>}</div><div className="details-bottom"><span><ShieldCheck size={14}/> PRIVATE CONVERSATION</span></div></> : <div className="details-quiet"><div className="quiet-line"/><p>Your closest circles,<br/>without the noise.</p><span>MESSAGES / CALLS / PEOPLE</span></div>}
       </aside>
-      {call && <div className="call-overlay" role="dialog" aria-modal="true" aria-label="Voice call"><div className="call-window"><button className="icon-button call-close" onClick={() => finishCall(true)} title="End call"><X size={18}/></button><div className="call-orbit"><div className="avatar call-avatar">{initials(call.peer.name)}</div><span className="call-pulse"/></div><span className="call-label">{call.phase === 'incoming' ? 'INCOMING VOICE CALL' : call.phase === 'outgoing' ? 'REACHING OUT' : 'VOICE CONNECTION'}</span><h2>{call.peer.name}</h2><p>{call.phase === 'incoming' ? 'is calling you' : call.phase === 'outgoing' ? 'Waiting for them to pick up…' : 'You’re connected'}</p><div className="call-wave"><i/><i/><i/><i/><i/><i/><i/><i/><i/><i/><i/></div><div className="call-controls">{call.phase === 'incoming' ? <><button className="decline-call" title="Decline call" onClick={() => finishCall(true)}><Phone size={18}/></button><button className="accept-call" title="Accept call" onClick={acceptCall}><Phone size={18}/></button></> : <><button className={`mute-call ${muted ? 'is-muted' : ''}`} title={muted ? 'Unmute microphone' : 'Mute microphone'} onClick={toggleMute}>{muted ? <MicOff size={19}/> : <Mic size={19}/>}</button><button className="decline-call" title="End call" onClick={() => finishCall(true)}><Phone size={18}/></button></>}</div><span className="call-encryption"><ShieldCheck size={13}/> PEER-TO-PEER AUDIO</span></div></div>}
+      {call && <div className="call-overlay" role="dialog" aria-modal="true" aria-label={`${call.mode} call`}><div className={`call-window ${call.mode === 'video' ? 'video-call-window' : ''}`}><button className="icon-button call-close" onClick={() => finishCall(true)} title="End call"><X size={18}/></button>{call.mode === 'video' ? <div className="video-stage"><video ref={remoteVideo} autoPlay playsInline/><video ref={localVideo} autoPlay muted playsInline className="local-video"/>{call.phase !== 'active' && <div className="video-placeholder"><div className="avatar call-avatar">{initials(call.peer.name)}</div><span>{call.phase === 'incoming' ? 'Incoming video call' : 'Connecting video…'}</span></div>}</div> : <div className="call-orbit"><div className="avatar call-avatar">{initials(call.peer.name)}</div><span className="call-pulse"/></div>}<span className="call-label">{call.mode === 'video' ? 'VIDEO CALL' : call.phase === 'incoming' ? 'INCOMING VOICE CALL' : call.phase === 'outgoing' ? 'REACHING OUT' : 'VOICE CONNECTION'}</span><h2>{call.peer.name}</h2><p>{call.phase === 'incoming' ? `is calling you${call.mode === 'video' ? ' with video' : ''}` : call.phase === 'outgoing' ? 'Waiting for them to pick up…' : 'You’re connected'}</p>{call.mode === 'audio' && <div className="call-wave"><i/><i/><i/><i/><i/><i/><i/><i/><i/><i/><i/></div>}<div className="call-controls">{call.phase === 'incoming' ? <><button className="decline-call" title="Decline call" onClick={() => finishCall(true)}><Phone size={18}/></button><button className="accept-call" title="Accept call" onClick={acceptCall}><Phone size={18}/></button></> : <>{call.mode === 'video' && <button className={`mute-call ${cameraOff ? 'is-muted' : ''}`} title={cameraOff ? 'Turn camera on' : 'Turn camera off'} onClick={toggleCamera}>{cameraOff ? <VideoOff size={19}/> : <Video size={19}/>}</button>}<button className={`mute-call ${muted ? 'is-muted' : ''}`} title={muted ? 'Unmute microphone' : 'Mute microphone'} onClick={toggleMute}>{muted ? <MicOff size={19}/> : <Mic size={19}/>}</button><button className="decline-call" title="End call" onClick={() => finishCall(true)}><Phone size={18}/></button></>}</div><span className="call-encryption"><ShieldCheck size={13}/> PEER-TO-PEER {call.mode === 'video' ? 'VIDEO' : 'AUDIO'}</span></div></div>}
       <audio ref={remoteAudio} autoPlay/>
+      {groupModal && <div className="call-overlay" role="dialog" aria-modal="true" aria-label="Create group chat"><form className="group-modal" onSubmit={createGroup}><button type="button" className="icon-button call-close" onClick={() => setGroupModal(false)} title="Close"><X size={18}/></button><span className="section-label">MAKE A LITTLE ROOM</span><h2>New group</h2><label className="group-name-label">Group name<input value={groupName} onChange={(event) => setGroupName(event.target.value)} minLength={2} maxLength={60} placeholder="Sunday crew" required/></label><div className="group-picker-label">Add people <span>{groupMembers.length} selected</span></div><div className="group-picker">{people.map((person) => <label className="group-option" key={person.id}><input type="checkbox" checked={groupMembers.includes(person.id)} onChange={(event) => setGroupMembers((current) => event.target.checked ? [...current, person.id] : current.filter((id) => id !== person.id))}/><span className="avatar">{initials(person.name)}</span><span>{person.name}</span><small>{person.email}</small></label>)}</div><button className="primary-button group-submit" disabled={groupName.trim().length < 2 || groupMembers.length === 0}>Create group <ArrowUpRight size={17}/></button></form></div>}
       {authError && me && <div className="toast" role="status">{authError}<button onClick={() => setAuthError('')} aria-label="Dismiss"><X size={15}/></button></div>}
     </main>
   );
