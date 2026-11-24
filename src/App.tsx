@@ -53,6 +53,7 @@ export default function App() {
   const [muted, setMuted] = useState(false);
   const [cameraOff, setCameraOff] = useState(false);
   const [canInstall, setCanInstall] = useState(false);
+  const [persistentStorage, setPersistentStorage] = useState<boolean | null>(null);
   const [mobileChat, setMobileChat] = useState(false);
   const [hasMoreMessages, setHasMoreMessages] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -81,6 +82,12 @@ export default function App() {
   useEffect(() => {
     if (call?.mode === 'video' && localVideo.current && localStream.current) localVideo.current.srcObject = localStream.current;
   }, [call]);
+
+  useEffect(() => {
+    request<{ persistentStorage?: boolean }>('/api/health')
+      .then(({ persistentStorage: enabled }) => setPersistentStorage(Boolean(enabled)))
+      .catch(() => setPersistentStorage(false));
+  }, []);
 
   useEffect(() => {
     const handleInstallPrompt = (event: Event) => {
@@ -380,6 +387,7 @@ export default function App() {
       </aside>
       <aside className="inbox">
         <header className="inbox-header"><div><div className="section-label">YOUR SPACE</div><h2>Messages <span>{conversationTargets.length}</span></h2></div><div className="inbox-header-actions"><button className={`icon-button ${canInstall ? 'install-ready' : ''}`} title="Install Relay" onClick={installApp}><Download size={17}/></button><button className="icon-button compose-button" title="Create group chat" onClick={() => setGroupModal(true)}><Plus size={18}/></button></div></header>
+        {persistentStorage === false && <div className="storage-warning" role="status">Accounts may reset after a server restart. Add a persistent PostgreSQL database to keep them.</div>}
         <label className="search-box"><Search size={16}/><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Find someone"/><span className="search-shortcut">/</span></label>
         <div className="inbox-tabs"><button className={peopleFilter === 'all' ? 'tab-selected' : ''} onClick={() => setPeopleFilter('all')}>All <span>{conversationTargets.length}</span></button><button className={peopleFilter === 'online' ? 'tab-selected' : ''} onClick={() => setPeopleFilter('online')}>Online <i className="tab-dot"/></button></div>
         <div className="contact-list">

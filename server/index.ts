@@ -90,7 +90,7 @@ function requireUser(request: express.Request, response: express.Response, next:
 }
 const app = express();
 app.use(express.json({ limit: '1mb' }));
-app.get('/api/health', (request, response) => response.json({ status: 'ok', persistentStorage: Boolean(pool) }));
+app.get('/api/health', (request, response) => response.json({ status: 'ok', persistentStorage: Boolean(pool) || !isProduction }));
 app.post('/api/register', async (request, response) => {
   const name = typeof request.body.name === 'string' ? request.body.name.trim().replace(/\s+/g, ' ') : '';
   const email = typeof request.body.email === 'string' ? request.body.email.trim().toLowerCase() : '';

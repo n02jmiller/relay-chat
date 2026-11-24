@@ -4,6 +4,7 @@ import App from './App';
 import './styles.css';
 import './features.css';
 import './group-call.css';
+import './storage-warning.css';
 
 if ('serviceWorker' in navigator && import.meta.env.PROD) {
   window.addEventListener('load', () => {
