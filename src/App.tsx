@@ -11,7 +11,7 @@ type User = { id: string; name: string; email: string; online?: boolean; lastSee
 type Group = { id: string; name: string; memberIds: string[]; createdAt: string };
 type ChatTarget = { id: string; name: string; email?: string; online?: boolean; group?: boolean; memberIds?: string[] };
 type Message = { id: string; senderId: string; recipientId: string; groupId?: string; text: string; createdAt: string };
-type CallState = { peer: User; phase: 'incoming' | 'outgoing' | 'active'; mode: 'audio' | 'video'; offer?: RTCSessionDescriptionInit };
+type CallState = { peer: User; phase: 'incoming' | 'outgoing' | 'active'; mode: 'audio' | 'video'; offer?: RTCSessionDescriptionInit; groupCall?: { groupId: string; name: string; roomId: string } };
 
 const tokenKey = 'relay-token';
 const initials = (name: string) => name.split(/\s+/).slice(0, 2).map((part) => part[0]).join('').toUpperCase();
@@ -36,6 +36,7 @@ export default function App() {
   const [selected, setSelected] = useState<ChatTarget | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [text, setText] = useState('');
+  const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [peopleFilter, setPeopleFilter] = useState<'all' | 'online'>('all');
   const [groupModal, setGroupModal] = useState(false);
@@ -121,6 +122,9 @@ export default function App() {
       refreshPeople();
     });
     client.on('call:offer', ({ from, offer, mode }: { from: User; offer: RTCSessionDescriptionInit; mode?: 'audio' | 'video' }) => setCall({ peer: from, phase: 'incoming', mode: mode || 'audio', offer }));
+    client.on('call:groupInvite', ({ from, groupId, groupName, roomId }: { from: User; groupId: string; groupName: string; roomId: string }) => {
+      setCall({ peer: from, phase: 'incoming', mode: 'video', groupCall: { groupId, name: groupName, roomId } });
+    });
     client.on('call:answer', async ({ answer }: { answer: RTCSessionDescriptionInit }) => {
       const connection = peerConnection.current;
       if (!connection) return;
@@ -239,6 +243,12 @@ export default function App() {
     });
   }
 
+  function addEmoji(emoji: string) {
+    setText((current) => `${current}${emoji}`);
+    setEmojiPickerOpen(false);
+    document.querySelector<HTMLInputElement>('.composer input')?.focus();
+  }
+
   function createPeer(peer: User, mode: 'audio' | 'video') {
     const connection = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
     peerConnection.current = connection;
@@ -274,6 +284,10 @@ export default function App() {
 
   async function acceptCall() {
     const pending = callRef.current;
+    if (pending?.groupCall) {
+      setCall({ ...pending, phase: 'active' });
+      return;
+    }
     if (!pending?.offer) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: pending.mode === 'video' });
@@ -293,7 +307,8 @@ export default function App() {
   }
 
   function finishCall(notify = true) {
-    if (notify && callRef.current) socket?.emit('call:end', { to: callRef.current.peer.id });
+    const activeCall = callRef.current;
+    if (notify && activeCall && !activeCall.groupCall) socket?.emit('call:end', { to: activeCall.peer.id });
     peerConnection.current?.close(); peerConnection.current = null;
     localStream.current?.getTracks().forEach((track) => track.stop()); localStream.current = null;
     queuedIce.current = [];
@@ -311,6 +326,14 @@ export default function App() {
   function toggleCamera() {
     const next = !cameraOff; setCameraOff(next);
     localStream.current?.getVideoTracks().forEach((track) => { track.enabled = !next; });
+  }
+
+  function startGroupVideoCall(group: Group) {
+    if (!socket || !me) return;
+    const roomId = `Relay-${crypto.randomUUID()}`;
+    const target = { groupId: group.id, name: group.name, roomId };
+    socket.emit('call:groupInvite', { groupId: group.id, roomId });
+    setCall({ peer: me, phase: 'active', mode: 'video', groupCall: target });
   }
 
   if (!me) return (
@@ -377,7 +400,7 @@ export default function App() {
             <button className="icon-button back-button" onClick={() => setMobileChat(false)} title="Back to messages"><ArrowLeft size={18}/></button>
             <div className={`avatar conversation-avatar ${selected.group ? 'group-avatar' : ''}`}>{initials(selected.name)}{!selected.group && <i className={selected.online ? 'online-dot' : 'offline-dot'}/>}</div>
             <div className="conversation-person"><h2>{selected.name}</h2><span>{selected.group ? `${selected.memberIds?.length || 0} members` : <><i className={selected.online ? 'status-dot' : 'status-dot away'}/>{selected.online ? 'Online now' : 'Away'}</>}</span></div>
-            <div className="conversation-actions">{!selected.group && <><button className="icon-button call-action" title="Start voice call" onClick={() => { const peer = people.find((person) => person.id === selected.id); if (peer) void startCall(peer, 'audio'); }} disabled={!!call}><Phone size={18}/></button><button className="icon-button call-action" title="Start video call" onClick={() => { const peer = people.find((person) => person.id === selected.id); if (peer) void startCall(peer, 'video'); }} disabled={!!call}><Video size={18}/></button></>}<button className="icon-button" title="More options"><MoreHorizontal size={19}/></button></div>
+            <div className="conversation-actions">{selected.group ? <button className="icon-button call-action" title="Start group video chat" onClick={() => { const group = groups.find((candidate) => candidate.id === selected.id); if (group) startGroupVideoCall(group); }} disabled={!!call}><Video size={18}/></button> : <><button className="icon-button call-action" title="Start voice call" onClick={() => { const peer = people.find((person) => person.id === selected.id); if (peer) void startCall(peer, 'audio'); }} disabled={!!call}><Phone size={18}/></button><button className="icon-button call-action" title="Start video call" onClick={() => { const peer = people.find((person) => person.id === selected.id); if (peer) void startCall(peer, 'video'); }} disabled={!!call}><Video size={18}/></button></>}<button className="icon-button" title="More options"><MoreHorizontal size={19}/></button></div>
           </header>
           <div className="message-area" ref={messagesArea} onScroll={handleMessageScroll}>
             <div className="thread-intro"><div className={`avatar intro-avatar ${selected.group ? 'group-avatar' : ''}`}>{initials(selected.name)}</div><h3>{selected.group ? selected.name : `You and ${selected.name.split(' ')[0]}`}</h3><p>{selected.group ? `${selected.memberIds?.length || 0} people in this conversation.` : 'This is the beginning of something good.'}</p><span>{selected.group ? 'GROUP CONVERSATION' : 'DIRECT CONVERSATION'}</span></div>
@@ -398,7 +421,7 @@ export default function App() {
               <div ref={messagesEnd}/>
             </div>
           </div>
-          <form className="composer" onSubmit={sendMessage}><div className="composer-tools"><button type="button" className="icon-button" title="Attach a file"><Plus size={18}/></button></div><input value={text} onChange={(event) => setText(event.target.value)} placeholder={`Message ${selected.group ? selected.name : selected.name.split(' ')[0]}…`} aria-label="Message"/><button type="button" className="icon-button emoji-button" title="Emoji"><Smile size={18}/></button><button className="send-button" title="Send message" disabled={!text.trim()}><Send size={17}/></button></form>
+          <form className="composer" onSubmit={sendMessage}><div className="composer-tools"><button type="button" className="icon-button" title="Attach a file"><Plus size={18}/></button></div><input value={text} onChange={(event) => setText(event.target.value)} placeholder={`Message ${selected.group ? selected.name : selected.name.split(' ')[0]}…`} aria-label="Message"/><div className="emoji-picker-container"><button type="button" className="icon-button emoji-button" title="Choose emoji" aria-expanded={emojiPickerOpen} onClick={() => setEmojiPickerOpen((open) => !open)}><Smile size={18}/></button>{emojiPickerOpen && <div className="emoji-picker" role="group" aria-label="Choose an emoji">{['😀','😂','🥰','😍','😊','🙌','👏','🎉','❤️','👍','✨','😭','🤔','😎','🔥','🙏'].map((emoji) => <button type="button" key={emoji} onClick={() => addEmoji(emoji)} aria-label={`Add ${emoji}`}>{emoji}</button>)}</div>}</div><button className="send-button" title="Send message" disabled={!text.trim()}><Send size={17}/></button></form>
           <div className="conversation-footnote"><span>{selected.group ? 'A SHARED GROUP CONVERSATION' : 'MESSAGES ARE JUST BETWEEN YOU TWO'}</span><span><ChevronDown size={12}/> ENTER TO SEND</span></div>
         </> : <div className="welcome-state"><div className="welcome-symbol"><AudioLines size={26}/></div><span className="eyebrow">YOUR PEOPLE, RIGHT HERE</span><h2>A good conversation<br/><em>starts somewhere.</em></h2><p>Choose someone from your messages to pick up where you left off.</p><div className="welcome-line"><span/><span className="welcome-dot"/><span/></div></div>}
       </section>
@@ -406,7 +429,8 @@ export default function App() {
         <div className="details-top"><span className="section-label">YOUR PEOPLE</span><button className="icon-button" title="More"><MoreHorizontal size={18}/></button></div>
         {selected ? <><div className="person-card"><div className={`avatar person-avatar ${selected.group ? 'group-avatar' : ''}`}>{initials(selected.name)}{!selected.group && <i className={selected.online ? 'online-dot' : 'offline-dot'}/>}</div><h2>{selected.name}</h2><span>{selected.group ? `${selected.memberIds?.length || 0} members` : selected.email}</span>{!selected.group && <div className="person-presence"><i className={selected.online ? 'status-dot' : 'status-dot away'}/>{selected.online ? 'Available to chat' : 'Not online right now'}</div>}<div className="person-shortcuts">{!selected.group && <button onClick={() => { const peer = people.find((person) => person.id === selected.id); if (peer) void startCall(peer, 'video'); }} disabled={!!call}><Video size={17}/><span>Video</span></button>}<button onClick={() => document.querySelector<HTMLInputElement>('.composer input')?.focus()}><Send size={16}/><span>Message</span></button></div></div><div className="details-divider"/><div className="details-section"><div className="details-heading">{selected.group ? 'People' : 'Shared space'}</div>{selected.group ? <div className="group-member-list">{selected.memberIds?.map((memberId) => { const member = memberId === me.id ? me : people.find((person) => person.id === memberId); return member ? <div className="group-member" key={memberId}><div className="avatar">{initials(member.name)}</div><span>{member.name}{memberId === me.id ? ' (you)' : ''}</span></div> : null; })}</div> : <div className="shared-empty"><div className="shared-icon"><Headphones size={17}/></div><p>Your calls together<br/>will show up here.</p></div>}</div><div className="details-bottom"><span><ShieldCheck size={14}/> PRIVATE CONVERSATION</span></div></> : <div className="details-quiet"><div className="quiet-line"/><p>Your closest circles,<br/>without the noise.</p><span>MESSAGES / CALLS / PEOPLE</span></div>}
       </aside>
-      {call && <div className="call-overlay" role="dialog" aria-modal="true" aria-label={`${call.mode} call`}><div className={`call-window ${call.mode === 'video' ? 'video-call-window' : ''}`}><button className="icon-button call-close" onClick={() => finishCall(true)} title="End call"><X size={18}/></button>{call.mode === 'video' ? <div className="video-stage"><video ref={remoteVideo} autoPlay playsInline/><video ref={localVideo} autoPlay muted playsInline className="local-video"/>{call.phase !== 'active' && <div className="video-placeholder"><div className="avatar call-avatar">{initials(call.peer.name)}</div><span>{call.phase === 'incoming' ? 'Incoming video call' : 'Connecting video…'}</span></div>}</div> : <div className="call-orbit"><div className="avatar call-avatar">{initials(call.peer.name)}</div><span className="call-pulse"/></div>}<span className="call-label">{call.mode === 'video' ? 'VIDEO CALL' : call.phase === 'incoming' ? 'INCOMING VOICE CALL' : call.phase === 'outgoing' ? 'REACHING OUT' : 'VOICE CONNECTION'}</span><h2>{call.peer.name}</h2><p>{call.phase === 'incoming' ? `is calling you${call.mode === 'video' ? ' with video' : ''}` : call.phase === 'outgoing' ? 'Waiting for them to pick up…' : 'You’re connected'}</p>{call.mode === 'audio' && <div className="call-wave"><i/><i/><i/><i/><i/><i/><i/><i/><i/><i/><i/></div>}<div className="call-controls">{call.phase === 'incoming' ? <><button className="decline-call" title="Decline call" onClick={() => finishCall(true)}><Phone size={18}/></button><button className="accept-call" title="Accept call" onClick={acceptCall}><Phone size={18}/></button></> : <>{call.mode === 'video' && <button className={`mute-call ${cameraOff ? 'is-muted' : ''}`} title={cameraOff ? 'Turn camera on' : 'Turn camera off'} onClick={toggleCamera}>{cameraOff ? <VideoOff size={19}/> : <Video size={19}/>}</button>}<button className={`mute-call ${muted ? 'is-muted' : ''}`} title={muted ? 'Unmute microphone' : 'Mute microphone'} onClick={toggleMute}>{muted ? <MicOff size={19}/> : <Mic size={19}/>}</button><button className="decline-call" title="End call" onClick={() => finishCall(true)}><Phone size={18}/></button></>}</div><span className="call-encryption"><ShieldCheck size={13}/> PEER-TO-PEER {call.mode === 'video' ? 'VIDEO' : 'AUDIO'}</span></div></div>}
+      {call && !call.groupCall && <div className="call-overlay" role="dialog" aria-modal="true" aria-label={`${call.mode} call`}><div className={`call-window ${call.mode === 'video' ? 'video-call-window' : ''}`}><button className="icon-button call-close" onClick={() => finishCall(true)} title="End call"><X size={18}/></button>{call.mode === 'video' ? <div className="video-stage"><video ref={remoteVideo} autoPlay playsInline/><video ref={localVideo} autoPlay muted playsInline className="local-video"/>{call.phase !== 'active' && <div className="video-placeholder"><div className="avatar call-avatar">{initials(call.peer.name)}</div><span>{call.phase === 'incoming' ? 'Incoming video call' : 'Connecting video…'}</span></div>}</div> : <div className="call-orbit"><div className="avatar call-avatar">{initials(call.peer.name)}</div><span className="call-pulse"/></div>}<span className="call-label">{call.mode === 'video' ? 'VIDEO CALL' : call.phase === 'incoming' ? 'INCOMING VOICE CALL' : call.phase === 'outgoing' ? 'REACHING OUT' : 'VOICE CONNECTION'}</span><h2>{call.peer.name}</h2><p>{call.phase === 'incoming' ? `is calling you${call.mode === 'video' ? ' with video' : ''}` : call.phase === 'outgoing' ? 'Waiting for them to pick up…' : 'You’re connected'}</p>{call.mode === 'audio' && <div className="call-wave"><i/><i/><i/><i/><i/><i/><i/><i/><i/><i/><i/></div>}<div className="call-controls">{call.phase === 'incoming' ? <><button className="decline-call" title="Decline call" onClick={() => finishCall(true)}><Phone size={18}/></button><button className="accept-call" title="Accept call" onClick={acceptCall}><Phone size={18}/></button></> : <>{call.mode === 'video' && <button className={`mute-call ${cameraOff ? 'is-muted' : ''}`} title={cameraOff ? 'Turn camera on' : 'Turn camera off'} onClick={toggleCamera}>{cameraOff ? <VideoOff size={19}/> : <Video size={19}/>}</button>}<button className={`mute-call ${muted ? 'is-muted' : ''}`} title={muted ? 'Unmute microphone' : 'Mute microphone'} onClick={toggleMute}>{muted ? <MicOff size={19}/> : <Mic size={19}/>}</button><button className="decline-call" title="End call" onClick={() => finishCall(true)}><Phone size={18}/></button></>}</div><span className="call-encryption"><ShieldCheck size={13}/> PEER-TO-PEER {call.mode === 'video' ? 'VIDEO' : 'AUDIO'}</span></div></div>}
+      {call?.groupCall && <div className="call-overlay" role="dialog" aria-modal="true" aria-label="Group video call"><div className="group-video-window"><header><div><span className="call-label">GROUP VIDEO CHAT</span><h2>{call.groupCall.name}</h2><p>{call.phase === 'incoming' ? `${call.peer.name} invited you` : 'Video is hosted by Jitsi Meet'}</p></div><button className="icon-button" onClick={() => call.phase === 'incoming' ? setCall(null) : finishCall(true)} title={call.phase === 'incoming' ? 'Decline invite' : 'Leave group call'}><X size={18}/></button></header>{call.phase === 'incoming' ? <div className="group-call-invite"><div className="avatar call-avatar">{initials(call.peer.name)}</div><button className="decline-call" title="Decline group call" onClick={() => setCall(null)}><Phone size={18}/></button><button className="accept-call" title="Join group call" onClick={acceptCall}><Video size={18}/></button></div> : <iframe className="group-video-frame" title={`Group call: ${call.groupCall.name}`} src={`https://meet.jit.si/${call.groupCall.roomId}#userInfo.displayName=${encodeURIComponent(me.name)}&config.prejoinPageEnabled=false`} allow="camera; microphone; fullscreen; display-capture; autoplay" referrerPolicy="no-referrer"/>}<span className="call-encryption">GROUP VIDEO HOSTED BY JITSI MEET. ANYONE WITH THE ROOM LINK MAY JOIN.</span></div></div>}
       <audio ref={remoteAudio} autoPlay/>
       {groupModal && <div className="call-overlay" role="dialog" aria-modal="true" aria-label="Create group chat"><form className="group-modal" onSubmit={createGroup}><button type="button" className="icon-button call-close" onClick={() => setGroupModal(false)} title="Close"><X size={18}/></button><span className="section-label">MAKE A LITTLE ROOM</span><h2>New group</h2><label className="group-name-label">Group name<input value={groupName} onChange={(event) => setGroupName(event.target.value)} minLength={2} maxLength={60} placeholder="Sunday crew" required/></label><div className="group-picker-label">Add people <span>{groupMembers.length} selected</span></div><div className="group-picker">{people.map((person) => <label className="group-option" key={person.id}><input type="checkbox" checked={groupMembers.includes(person.id)} onChange={(event) => setGroupMembers((current) => event.target.checked ? [...current, person.id] : current.filter((id) => id !== person.id))}/><span className="avatar">{initials(person.name)}</span><span>{person.name}</span><small>{person.email}</small></label>)}</div><button className="primary-button group-submit" disabled={groupName.trim().length < 2 || groupMembers.length === 0}>Create group <ArrowUpRight size={17}/></button></form></div>}
       {authError && me && <div className="toast" role="status">{authError}<button onClick={() => setAuthError('')} aria-label="Dismiss"><X size={15}/></button></div>}
