@@ -1,0 +1,156 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import express from 'express';
+import { createServer } from 'node:http';
+import { Server, Socket } from 'socket.io';
+import bcrypt from 'bcryptjs';
+
+type StoredUser = { id: string; name: string; email: string; passwordHash: string; createdAt: string };
+type ChatMessage = { id: string; senderId: string; recipientId: string; text: string; createdAt: string };
+type Database = { users: StoredUser[]; messages: ChatMessage[] };
+type AuthedSocket = Socket & { data: { userId?: string } };
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const dataFile = process.env.RELAY_DATA_FILE || path.join(here, 'data.json');
+const secret = process.env.RELAY_TOKEN_SECRET || crypto.randomBytes(32).toString('hex');
+const port = Number(process.env.PORT || 3001);
+const isProduction = process.env.NODE_ENV === 'production';
+const clientBuild = path.resolve(here, '..', 'dist');
+
+if (isProduction && !process.env.RELAY_TOKEN_SECRET) {
+  throw new Error('RELAY_TOKEN_SECRET must be set in production.');
+}
+
+function loadDatabase(): Database {
+  try { return JSON.parse(fs.readFileSync(dataFile, 'utf8')) as Database; }
+  catch { return { users: [], messages: [] }; }
+}
+const database = loadDatabase();
+function saveDatabase() {
+  fs.mkdirSync(path.dirname(dataFile), { recursive: true });
+  fs.writeFileSync(dataFile, JSON.stringify(database, null, 2));
+}
+function publicUser(user: StoredUser) {
+  return { id: user.id, name: user.name, email: user.email };
+}
+function signToken(userId: string) {
+  const payload = Buffer.from(JSON.stringify({ userId, expiresAt: Date.now() + 1000 * 60 * 60 * 24 * 14 })).toString('base64url');
+  const signature = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
+  return `${payload}.${signature}`;
+}
+function verifyToken(token?: string) {
+  if (!token) return null;
+  const [payload, signature] = token.split('.');
+  if (!payload || !signature) return null;
+  const expected = crypto.createHmac('sha256', secret).update(payload).digest();
+  let actual: Buffer;
+  try { actual = Buffer.from(signature, 'base64url'); } catch { return null; }
+  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) return null;
+  try {
+    const decoded = JSON.parse(Buffer.from(payload, 'base64url').toString()) as { userId: string; expiresAt: number };
+    return decoded.expiresAt > Date.now() ? database.users.find((user) => user.id === decoded.userId) || null : null;
+  } catch { return null; }
+}
+function requireUser(request: express.Request, response: express.Response, next: express.NextFunction) {
+  const user = verifyToken(request.header('authorization')?.replace(/^Bearer\s+/i, ''));
+  if (!user) { response.status(401).json({ error: 'Please sign in again.' }); return; }
+  response.locals.user = user;
+  next();
+}
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+app.get('/api/health', (request, response) => response.json({ status: 'ok' }));
+app.post('/api/register', async (request, response) => {
+  const name = typeof request.body.name === 'string' ? request.body.name.trim().replace(/\s+/g, ' ') : '';
+  const email = typeof request.body.email === 'string' ? request.body.email.trim().toLowerCase() : '';
+  const password = typeof request.body.password === 'string' ? request.body.password : '';
+  if (name.length < 2 || name.length > 50) { response.status(400).json({ error: 'Name must be between 2 and 50 characters.' }); return; }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) { response.status(400).json({ error: 'Enter a valid email address.' }); return; }
+  if (password.length < 8 || password.length > 128) { response.status(400).json({ error: 'Password must be at least 8 characters.' }); return; }
+  if (database.users.some((user) => user.email === email)) { response.status(409).json({ error: 'An account with that email already exists.' }); return; }
+  const user: StoredUser = { id: crypto.randomUUID(), name, email, passwordHash: await bcrypt.hash(password, 12), createdAt: new Date().toISOString() };
+  database.users.push(user); saveDatabase();
+  response.status(201).json({ token: signToken(user.id), user: publicUser(user) });
+});
+app.post('/api/login', async (request, response) => {
+  const email = typeof request.body.email === 'string' ? request.body.email.trim().toLowerCase() : '';
+  const password = typeof request.body.password === 'string' ? request.body.password : '';
+  const user = database.users.find((candidate) => candidate.email === email);
+  if (!user || !(await bcrypt.compare(password, user.passwordHash))) { response.status(401).json({ error: 'That email and password do not match.' }); return; }
+  response.json({ token: signToken(user.id), user: publicUser(user) });
+});
+app.get('/api/me', requireUser, (request, response) => response.json({ user: publicUser(response.locals.user as StoredUser) }));
+
+const httpServer = createServer(app);
+const io = new Server(httpServer);
+const activeSockets = new Map<string, Set<string>>();
+const onlineIds = () => [...activeSockets.keys()];
+
+app.get('/api/users', requireUser, (request, response) => {
+  const user = response.locals.user as StoredUser;
+  response.json({ users: database.users.filter((candidate) => candidate.id !== user.id).map((candidate) => ({ ...publicUser(candidate), online: activeSockets.has(candidate.id) })) });
+});
+app.get('/api/messages/:peerId', requireUser, (request, response) => {
+  const user = response.locals.user as StoredUser;
+  const peerId = request.params.peerId;
+  if (!database.users.some((candidate) => candidate.id === peerId)) { response.status(404).json({ error: 'Person not found.' }); return; }
+  const messages = database.messages.filter((message) => (message.senderId === user.id && message.recipientId === peerId) || (message.senderId === peerId && message.recipientId === user.id));
+  response.json({ messages });
+});
+
+if (isProduction) {
+  app.use(express.static(clientBuild, { index: false }));
+  app.use((request, response, next) => {
+    if (request.method !== 'GET' || request.path.startsWith('/api/')) { next(); return; }
+    response.sendFile(path.join(clientBuild, 'index.html'), (error) => {
+      if (error) next(error);
+    });
+  });
+}
+
+io.use((socket, next) => {
+  const user = verifyToken(socket.handshake.auth?.token as string | undefined);
+  if (!user) { next(new Error('Please sign in again.')); return; }
+  (socket as AuthedSocket).data.userId = user.id;
+  next();
+});
+function emitPresence() { io.emit('presence:update', onlineIds()); }
+function relayToPeer(socket: AuthedSocket, event: string, peerId: unknown, payload: Record<string, unknown> = {}) {
+  if (typeof peerId !== 'string' || !database.users.some((user) => user.id === peerId)) return;
+  const sender = database.users.find((user) => user.id === socket.data.userId);
+  if (sender) io.to(`user:${peerId}`).emit(event, { ...payload, from: publicUser(sender) });
+}
+
+io.on('connection', (rawSocket) => {
+  const socket = rawSocket as AuthedSocket;
+  const userId = socket.data.userId!;
+  socket.join(`user:${userId}`);
+  const sockets = activeSockets.get(userId) || new Set<string>();
+  sockets.add(socket.id); activeSockets.set(userId, sockets);
+  emitPresence();
+
+  socket.on('message:send', (payload: { recipientId?: unknown; text?: unknown }, acknowledge?: (result: { error?: string; message?: ChatMessage }) => void) => {
+    const recipientId = payload?.recipientId;
+    const text = typeof payload?.text === 'string' ? payload.text.trim() : '';
+    if (typeof recipientId !== 'string' || recipientId === userId || !database.users.some((user) => user.id === recipientId)) { acknowledge?.({ error: 'Choose a valid person to message.' }); return; }
+    if (!text || text.length > 5000) { acknowledge?.({ error: 'Messages must be between 1 and 5000 characters.' }); return; }
+    const message: ChatMessage = { id: crypto.randomUUID(), senderId: userId, recipientId, text, createdAt: new Date().toISOString() };
+    database.messages.push(message); saveDatabase();
+    io.to(`user:${userId}`).to(`user:${recipientId}`).emit('message:new', message);
+    acknowledge?.({ message });
+  });
+  socket.on('call:offer', (payload: { to?: unknown; offer?: unknown }) => relayToPeer(socket, 'call:offer', payload?.to, { offer: payload?.offer }));
+  socket.on('call:answer', (payload: { to?: unknown; answer?: unknown }) => relayToPeer(socket, 'call:answer', payload?.to, { answer: payload?.answer }));
+  socket.on('call:ice', (payload: { to?: unknown; candidate?: unknown }) => relayToPeer(socket, 'call:ice', payload?.to, { candidate: payload?.candidate }));
+  socket.on('call:end', (payload: { to?: unknown }) => relayToPeer(socket, 'call:end', payload?.to));
+  socket.on('disconnect', () => {
+    const current = activeSockets.get(userId);
+    current?.delete(socket.id);
+    if (!current?.size) activeSockets.delete(userId);
+    emitPresence();
+  });
+});
+
+httpServer.listen(port, () => console.log(`Relay API and signaling server listening on http://localhost:${port}`));
