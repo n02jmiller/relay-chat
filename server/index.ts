@@ -125,7 +125,7 @@ app.get('/api/groups', requireUser, (request, response) => {
   const user = response.locals.user as StoredUser;
   response.json({ groups: database.groups.filter((group) => group.memberIds.includes(user.id)) });
 });
-app.post('/api/groups', requireUser, (request, response) => {
+app.post('/api/groups', requireUser, async (request, response) => {
   const user = response.locals.user as StoredUser;
   const name = typeof request.body.name === 'string' ? request.body.name.trim().replace(/\s+/g, ' ') : '';
   const requestedIds = Array.isArray(request.body.memberIds) ? request.body.memberIds.filter((id: unknown): id is string => typeof id === 'string') : [];
